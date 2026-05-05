@@ -62,6 +62,7 @@ from lottery_sim.data_sources.ssq_17500 import (
 )
 from lottery_sim.data_sources.incremental import render_incremental_update_result, update_draws_csv
 from lottery_sim.dashboard import serve_dashboard
+from lottery_sim.fastapi_app import serve_fastapi_dashboard
 from lottery_sim.games.fucai3d import Fucai3DGame
 from lottery_sim.games.dlt import DltGame
 from lottery_sim.games.kl8 import Kl8Game
@@ -459,6 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--reports", default="reports/latest", help="报告目录")
     dashboard.add_argument("--host", default="127.0.0.1", help="监听地址")
     dashboard.add_argument("--port", type=int, default=8765, help="监听端口")
+    dashboard.add_argument("--server", choices=("auto", "stdlib", "fastapi"), default="auto", help="Web服务类型")
     dashboard.add_argument("--open", dest="open_browser", action="store_true", help="启动后自动打开浏览器")
     dashboard.add_argument("--no-open", dest="open_browser", action="store_false", help="启动后不自动打开浏览器")
     dashboard.set_defaults(func=_dashboard, open_browser=False)
@@ -2117,6 +2119,25 @@ def _summarize_recommendations(args) -> None:
 
 
 def _dashboard(args) -> None:
+    if args.server == "fastapi":
+        serve_fastapi_dashboard(
+            reports_dir=Path(args.reports),
+            host=args.host,
+            port=args.port,
+            open_browser=args.open_browser,
+        )
+        return
+    if args.server == "auto":
+        try:
+            serve_fastapi_dashboard(
+                reports_dir=Path(args.reports),
+                host=args.host,
+                port=args.port,
+                open_browser=args.open_browser,
+            )
+            return
+        except RuntimeError as exc:
+            print(f"{exc}，已切换到内置本地服务。")
     serve_dashboard(
         reports_dir=Path(args.reports),
         host=args.host,

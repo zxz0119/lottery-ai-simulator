@@ -32,6 +32,9 @@
 - 保存每次推荐记录，按彩种和目标期号管理历史。
 - 开奖后自动校验推荐记录，统计命中等级、中奖金额和长期表现。
 - Web 仪表盘提供总览、候选号码、推荐历史、长期汇总和原始报告。
+- 本地 SQLite 保存执行历史、推荐快照、训练记录和大模型配置。
+- Web 任务使用 SSE 实时显示进度；分析页展示号码频率、遗漏排行、和值区间、分区走势和候选评分解释。
+- 后台配置页支持大模型 API 配置、本地 AI 总结、训练记录查看和 CSV/HTML 导出。
 - 本地运行产物默认忽略，方便整理后发布到 GitHub。
 
 ## 工作流程
@@ -49,6 +52,16 @@
 ```powershell
 $env:PYTHONPATH='src'
 python -m lottery_sim.cli dashboard --reports reports/latest --host 127.0.0.1 --port 8765
+```
+
+默认会优先尝试 FastAPI 服务；如果本机没有安装 FastAPI，会自动切换到内置本地服务，页面功能仍可使用。
+
+如需强制使用 FastAPI：
+
+```powershell
+pip install fastapi uvicorn
+$env:PYTHONPATH='src'
+python -m lottery_sim.cli dashboard --server fastapi --reports reports/latest --host 127.0.0.1 --port 8765
 ```
 
 浏览器访问：

@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from lottery_sim.history_db import (
+    load_dashboard_config as _load_sqlite_dashboard_config,
+    load_training_records as _load_sqlite_training_records,
+    record_dashboard_action as _record_sqlite_dashboard_action,
+    record_training_record as _record_sqlite_training_record,
+    save_dashboard_config as _save_sqlite_dashboard_config,
+    sync_recommendation_records,
+)
 from lottery_sim.issue_calendar import next_issue_from_latest_draw
 from lottery_sim.recommendation_tracking import RecommendationRecord, load_recommendation_records
 
@@ -112,11 +120,37 @@ class DashboardAnalysisSection:
 
 
 @dataclass(frozen=True)
+class DashboardRangeBucket:
+    label: str
+    count: int
+    rate: float
+
+
+@dataclass(frozen=True)
+class DashboardPartitionTrend:
+    label: str
+    average: float
+
+
+@dataclass(frozen=True)
+class DashboardCandidateScore:
+    rank: int
+    strategy: str
+    number: str
+    score: int
+    explanation: str
+
+
+@dataclass(frozen=True)
 class DashboardGameAnalysis:
     draw_count: int = 0
     latest_issue: str = ""
     latest_draw_date: str = ""
     sections: Tuple[DashboardAnalysisSection, ...] = ()
+    omission_sections: Tuple[DashboardAnalysisSection, ...] = ()
+    sum_ranges: Tuple[DashboardRangeBucket, ...] = ()
+    partition_trends: Tuple[DashboardPartitionTrend, ...] = ()
+    candidate_scores: Tuple[DashboardCandidateScore, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -156,6 +190,24 @@ class DashboardActionHistoryRecord:
 
 
 @dataclass(frozen=True)
+class DashboardTrainingRecord:
+    created_at: str
+    game_code: str
+    game_name: str
+    action: str
+    status: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class DashboardConfig:
+    llm_provider: str = ""
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key_masked: str = ""
+
+
+@dataclass(frozen=True)
 class DashboardModel:
     reports_dir: Path
     generated_at: str
@@ -163,6 +215,9 @@ class DashboardModel:
     games: Tuple[GameDashboard, ...]
     recommendation_summary: str
     other_reports: Dict[str, str]
+    config: DashboardConfig = field(default_factory=DashboardConfig)
+    training_records: Tuple[DashboardTrainingRecord, ...] = ()
+    ai_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -215,6 +270,10 @@ _DASHBOARD_JOBS_LOCK = threading.Lock()
 def load_dashboard_model(reports_dir: Path) -> DashboardModel:
     reports_path = Path(reports_dir)
     games = tuple(_load_game_dashboard(reports_path, code, name) for code, name in GAME_CONFIGS)
+    data_dir = _resolve_dashboard_data_dir(reports_path)
+    db_path = data_dir / "history.sqlite3"
+    config = _load_dashboard_config_model(db_path)
+    training_records = _load_dashboard_training_records(db_path, data_dir)
     text_reports = sorted(reports_path.glob("*.txt")) if reports_path.exists() else []
     known_report_names = {
         f"{kind}-{code}.txt"
@@ -233,7 +292,52 @@ def load_dashboard_model(reports_dir: Path) -> DashboardModel:
         games=games,
         recommendation_summary=_read_text(reports_path / "recommendation-summary.txt"),
         other_reports=other_reports,
+        config=config,
+        training_records=training_records,
+        ai_summary=_build_ai_summary(games, config, training_records),
     )
+
+
+def save_dashboard_config(db_path: Path, config: Dict[str, str]) -> None:
+    _save_sqlite_dashboard_config(Path(db_path), config)
+
+
+def export_dashboard_snapshot(model: DashboardModel, output_dir: Path, export_format: str) -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    normalized_format = export_format.lower().strip()
+    if normalized_format == "csv":
+        path = output_path / f"dashboard-summary-{stamp}.csv"
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "game_code",
+                "game_name",
+                "latest_target_issue",
+                "recommendation_total",
+                "checked",
+                "pending",
+                "winning",
+                "payout",
+            ])
+            for game in model.games:
+                writer.writerow([
+                    game.code,
+                    game.name,
+                    game.latest_target_issue,
+                    game.recommendation_total,
+                    game.recommendation_checked,
+                    game.recommendation_pending,
+                    game.recommendation_winning,
+                    game.recommendation_payout,
+                ])
+        return path
+    if normalized_format == "html":
+        path = output_path / f"dashboard-summary-{stamp}.html"
+        path.write_text(render_dashboard_html(model), encoding="utf-8")
+        return path
+    raise ValueError("export_format must be csv or html")
 
 
 def run_dashboard_action(
@@ -453,7 +557,27 @@ def _record_dashboard_job_history(job: DashboardJob, repo_root: Path) -> Dashboa
             archive_dir=archive_dir,
         )
     _append_dashboard_action_record(Path(repo_root) / "data", record)
+    _record_dashboard_action_to_sqlite(repo_root, record)
     return record
+
+
+def _record_dashboard_action_to_sqlite(repo_root: Path, record: DashboardActionHistoryRecord) -> None:
+    payload = {
+        "created_at": record.created_at,
+        "job_id": record.job_id,
+        "action": record.action,
+        "game_code": record.game_code,
+        "game_name": record.game_name,
+        "status": record.status,
+        "exit_code": record.exit_code,
+        "command": record.command,
+        "summary": record.summary,
+        "archive_dir": record.archive_dir,
+    }
+    db_path = _dashboard_db_path_for_root(repo_root)
+    _record_sqlite_dashboard_action(db_path, payload)
+    if record.action in {"daily", "generate"}:
+        _record_sqlite_training_record(db_path, payload)
 
 
 def _archive_dashboard_reports(job: DashboardJob, repo_root: Path) -> str:
@@ -565,6 +689,23 @@ def _job_snapshot(job: DashboardJob) -> Dict[str, Any]:
         }
 
 
+def _job_sse_events(
+    job: DashboardJob,
+    poll_interval: float = 1.0,
+    max_events: Optional[int] = None,
+):
+    emitted = 0
+    while True:
+        snapshot = _job_snapshot(job)
+        yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+        emitted += 1
+        if snapshot["status"] in {"completed", "failed"}:
+            return
+        if max_events is not None and emitted >= max_events:
+            return
+        time.sleep(poll_interval)
+
+
 def _job_progress_percent(job: DashboardJob) -> int:
     if job.status in {"completed", "failed"}:
         return 100
@@ -673,6 +814,7 @@ def render_dashboard_html(model: DashboardModel) -> str:
         _render_header(model),
         _render_actions(model.games),
         _render_global_recommendation_history(model.games),
+        _render_backend_panel(model),
         _render_lottery_tabs(model.games),
         _render_lottery_panes(model),
         "</main>",
@@ -728,7 +870,7 @@ def _load_game_dashboard(reports_path: Path, code: str, name: str) -> GameDashbo
     record_stats = _recommendation_record_stats(records)
     draw_dates = _load_dashboard_draw_dates(reports_path, code)
     target_draw_dates = _recommendation_target_draw_dates(records, draw_dates, code)
-    analysis = _load_dashboard_game_analysis(reports_path, code)
+    analysis = _load_dashboard_game_analysis(reports_path, code, candidates)
     return GameDashboard(
         code=code,
         name=name,
@@ -759,6 +901,8 @@ def _load_dashboard_recommendation_records(reports_path: Path, game_code: str) -
     records: List[RecommendationRecord] = []
     for path in sorted(game_dir.glob("*.csv")):
         records.extend(load_recommendation_records(path))
+    if records:
+        sync_recommendation_records(_dashboard_db_path_for_reports(reports_path), records)
     return tuple(records)
 
 
@@ -776,6 +920,69 @@ def _resolve_dashboard_data_dir(reports_path: Path) -> Path:
     return Path("data")
 
 
+def _dashboard_db_path_for_reports(reports_path: Path) -> Path:
+    return _resolve_dashboard_data_dir(reports_path) / "history.sqlite3"
+
+
+def _dashboard_db_path_for_root(repo_root: Path) -> Path:
+    return Path(repo_root) / "data" / "history.sqlite3"
+
+
+def _load_dashboard_config_model(db_path: Path) -> DashboardConfig:
+    config = _load_sqlite_dashboard_config(db_path)
+    return DashboardConfig(
+        llm_provider=config.get("llm_provider", ""),
+        llm_base_url=config.get("llm_base_url", ""),
+        llm_model=config.get("llm_model", ""),
+        llm_api_key_masked=config.get("llm_api_key_masked", ""),
+    )
+
+
+def _load_dashboard_training_records(db_path: Path, data_dir: Optional[Path] = None) -> Tuple[DashboardTrainingRecord, ...]:
+    records = _load_sqlite_training_records(db_path)
+    loaded = [
+        DashboardTrainingRecord(
+            created_at=str(record.get("created_at", "")),
+            game_code=str(record.get("game_code", "")),
+            game_name=str(record.get("game_name", "")),
+            action=str(record.get("action", "")),
+            status=str(record.get("status", "")),
+            summary=str(record.get("summary", "")),
+        )
+        for record in records
+    ]
+    if not loaded and data_dir is not None:
+        for record in _load_dashboard_action_history(data_dir):
+            if record.action not in {"daily", "generate"}:
+                continue
+            loaded.append(DashboardTrainingRecord(
+                created_at=record.created_at,
+                game_code=record.game_code,
+                game_name=record.game_name,
+                action=record.action,
+                status=record.status,
+                summary=record.summary,
+            ))
+    return tuple(loaded[:50])
+
+
+def _build_ai_summary(
+    games: Sequence[GameDashboard],
+    config: DashboardConfig,
+    training_records: Sequence[DashboardTrainingRecord],
+) -> str:
+    configured = "已配置" if config.llm_base_url and config.llm_model else "未配置"
+    total_recommendations = sum(game.recommendation_total for game in games)
+    pending = sum(game.recommendation_pending for game in games)
+    winning = sum(game.recommendation_winning for game in games)
+    latest_training = training_records[0].created_at if training_records else "暂无"
+    return (
+        f"大模型接口{configured}；当前推荐记录{total_recommendations}条，"
+        f"待开奖{pending}条，中奖记录{winning}条；最近训练/生成记录：{latest_training}。"
+        "未配置 API 时使用本地规则总结，配置后可扩展为真实大模型报告。"
+    )
+
+
 def _load_dashboard_draw_dates(reports_path: Path, game_code: str) -> Dict[str, str]:
     path = _resolve_history_data_dir(reports_path) / Path(GAME_CSV_PATHS[game_code]).name
     if not path.exists():
@@ -788,7 +995,11 @@ def _load_dashboard_draw_dates(reports_path: Path, game_code: str) -> Dict[str, 
         }
 
 
-def _load_dashboard_game_analysis(reports_path: Path, game_code: str) -> DashboardGameAnalysis:
+def _load_dashboard_game_analysis(
+    reports_path: Path,
+    game_code: str,
+    candidates: Sequence[DashboardCandidate] = (),
+) -> DashboardGameAnalysis:
     path = _resolve_history_data_dir(reports_path) / Path(GAME_CSV_PATHS[game_code]).name
     if not path.exists():
         return DashboardGameAnalysis()
@@ -817,11 +1028,27 @@ def _load_dashboard_game_analysis(reports_path: Path, game_code: str) -> Dashboa
         )
         for label, counter in counters.items()
     )
+    ordered_rows = sorted(rows, key=lambda row: _issue_sort_value(row.get("issue", "")))
+    omission_sections = tuple(
+        DashboardAnalysisSection(
+            label=f"{label}遗漏排行",
+            frequencies=_rank_number_omissions(game_code, label, column, ordered_rows, counter),
+        )
+        for label, column in ANALYSIS_COLUMNS.get(game_code, ())
+        for counter in (counters.get(label, Counter()),)
+    )
+    sum_ranges = _analysis_sum_ranges(game_code, ordered_rows)
+    partition_trends = _analysis_partition_trends(game_code, ordered_rows)
+    candidate_scores = _analysis_candidate_scores(game_code, candidates, counters, len(rows))
     return DashboardGameAnalysis(
         draw_count=len(rows),
         latest_issue=latest.get("issue", ""),
         latest_draw_date=latest.get("draw_date", ""),
         sections=sections,
+        omission_sections=omission_sections,
+        sum_ranges=sum_ranges,
+        partition_trends=partition_trends,
+        candidate_scores=candidate_scores,
     )
 
 
@@ -846,6 +1073,140 @@ def _rank_number_frequencies(counter: Counter, draw_count: int, limit: int = 12)
         )
         for number, count in ranked[:limit]
     )
+
+
+def _rank_number_omissions(
+    game_code: str,
+    label: str,
+    column: str,
+    rows: Sequence[Dict[str, str]],
+    counter: Counter,
+    limit: int = 12,
+) -> Tuple[DashboardNumberFrequency, ...]:
+    if not rows or not counter:
+        return ()
+    last_seen: Dict[str, int] = {}
+    for index, row in enumerate(rows):
+        for token in _analysis_tokens(game_code, row.get(column, "")):
+            last_seen[token] = index
+    current_index = len(rows) - 1
+    ranked = sorted(
+        (
+            (number, current_index - last_seen.get(number, -1))
+            for number in counter
+        ),
+        key=lambda item: (-item[1], _issue_sort_value(item[0]), item[0]),
+    )
+    return tuple(
+        DashboardNumberFrequency(number=str(number), count=omission, rate=0)
+        for number, omission in ranked[:limit]
+    )
+
+
+def _analysis_sum_ranges(game_code: str, rows: Sequence[Dict[str, str]]) -> Tuple[DashboardRangeBucket, ...]:
+    if not rows:
+        return ()
+    width = 10 if game_code in {"3d", "pl3", "pl5", "qxc"} else 30
+    counter: Counter = Counter()
+    for row in rows:
+        total = sum(_analysis_row_numbers(game_code, row))
+        start = (total // width) * width
+        counter[f"{start}-{start + width - 1}"] += 1
+    return tuple(
+        DashboardRangeBucket(label=label, count=count, rate=count / len(rows))
+        for label, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:8]
+    )
+
+
+def _analysis_partition_trends(game_code: str, rows: Sequence[Dict[str, str]]) -> Tuple[DashboardPartitionTrend, ...]:
+    if not rows:
+        return ()
+    max_number = _analysis_max_number(game_code)
+    totals: Counter = Counter()
+    for row in rows:
+        for number in _analysis_row_numbers(game_code, row):
+            totals[_partition_label(number, max_number)] += 1
+    return tuple(
+        DashboardPartitionTrend(label=label, average=totals[label] / len(rows))
+        for label in ("低区", "中区", "高区")
+    )
+
+
+def _analysis_candidate_scores(
+    game_code: str,
+    candidates: Sequence[DashboardCandidate],
+    counters: Dict[str, Counter],
+    draw_count: int,
+) -> Tuple[DashboardCandidateScore, ...]:
+    if not candidates or draw_count <= 0:
+        return ()
+    merged_counter: Counter = Counter()
+    for counter in counters.values():
+        merged_counter.update(counter)
+    max_number = _analysis_max_number(game_code)
+    scored: List[DashboardCandidateScore] = []
+    for candidate in candidates[:10]:
+        numbers = _candidate_numbers(game_code, candidate.number)
+        if not numbers:
+            continue
+        hot_ratio = sum(merged_counter.get(f"{number:02d}", merged_counter.get(str(number), 0)) for number in numbers)
+        hot_ratio = hot_ratio / max(1, len(numbers) * draw_count)
+        partition_counts = Counter(_partition_label(number, max_number) for number in numbers)
+        balance = len([value for value in partition_counts.values() if value > 0]) / 3
+        score = int(min(99, max(1, hot_ratio * 70 + balance * 30)))
+        explanation = (
+            f"频率均值{hot_ratio:.1%}，和值{sum(numbers)}，"
+            f"分区低/中/高={partition_counts['低区']}/{partition_counts['中区']}/{partition_counts['高区']}"
+        )
+        scored.append(DashboardCandidateScore(
+            rank=candidate.rank,
+            strategy=candidate.strategy,
+            number=candidate.number,
+            score=score,
+            explanation=explanation,
+        ))
+    return tuple(scored)
+
+
+def _analysis_row_numbers(game_code: str, row: Dict[str, str]) -> Tuple[int, ...]:
+    values: List[int] = []
+    for _, column in ANALYSIS_COLUMNS.get(game_code, ()):
+        for token in _analysis_tokens(game_code, row.get(column, "")):
+            try:
+                values.append(int(token))
+            except ValueError:
+                continue
+    return tuple(values)
+
+
+def _candidate_numbers(game_code: str, text: str) -> Tuple[int, ...]:
+    value = str(text or "")
+    if game_code in {"3d", "pl3", "pl5"} and " " not in value and "+" not in value:
+        return tuple(int(ch) for ch in value if ch.isdigit())
+    return tuple(int(match) for match in re.findall(r"\d+", value))
+
+
+def _analysis_max_number(game_code: str) -> int:
+    return {
+        "ssq": 33,
+        "dlt": 35,
+        "qlc": 30,
+        "kl8": 80,
+        "3d": 9,
+        "pl3": 9,
+        "pl5": 9,
+        "qxc": 9,
+    }.get(game_code, 33)
+
+
+def _partition_label(number: int, max_number: int) -> str:
+    first = max(1, max_number // 3)
+    second = max(first + 1, max_number * 2 // 3)
+    if number <= first:
+        return "低区"
+    if number <= second:
+        return "中区"
+    return "高区"
 
 
 def _recommendation_target_draw_dates(
@@ -1043,6 +1404,60 @@ def _render_global_recommendation_history(games: Sequence[GameDashboard]) -> str
   <div class="recommendation-batches">{rows}</div>
 </details>
 """.strip()
+
+
+def _render_backend_panel(model: DashboardModel) -> str:
+    config = model.config
+    training_rows = _render_training_record_rows(model.training_records)
+    return f"""
+<details class="panel backend-panel">
+  <summary class="recommendation-history-summary">
+    <strong>后台配置</strong>
+    <span>大模型、训练记录、AI总结和导出</span>
+  </summary>
+  <section class="backend-grid">
+    <form class="backend-card" id="llm-config-form">
+      <h3>大模型 API 配置</h3>
+      <label>服务商<input name="llm_provider" value="{html.escape(config.llm_provider)}" placeholder="openai-compatible"></label>
+      <label>Base URL<input name="llm_base_url" value="{html.escape(config.llm_base_url)}" placeholder="https://api.example.com/v1"></label>
+      <label>模型名称<input name="llm_model" value="{html.escape(config.llm_model)}" placeholder="gpt-4.1-mini"></label>
+      <label>API Key<input name="llm_api_key" value="" placeholder="{html.escape(config.llm_api_key_masked or '未配置')}"></label>
+      <button type="submit" class="action-button">保存配置</button>
+      <p class="panel-note" id="config-save-status">API Key 只保存在本地 SQLite，不会提交到 GitHub。</p>
+    </form>
+    <section class="backend-card">
+      <h3>模型训练记录</h3>
+      <table><thead><tr><th>时间</th><th>彩种</th><th>动作</th><th>状态</th></tr></thead><tbody>{training_rows}</tbody></table>
+    </section>
+    <section class="backend-card">
+      <h3>AI 报告总结</h3>
+      <p>{html.escape(model.ai_summary)}</p>
+    </section>
+    <section class="backend-card">
+      <h3>导出 CSV/HTML</h3>
+      <div class="export-actions">
+        <button type="button" class="action-button" data-export="csv">导出 CSV</button>
+        <button type="button" class="action-button" data-export="html">导出 HTML</button>
+      </div>
+      <p class="panel-note" id="export-status">导出文件会写入 reports/exports。</p>
+    </section>
+  </section>
+</details>
+""".strip()
+
+
+def _render_training_record_rows(records: Sequence[DashboardTrainingRecord]) -> str:
+    if not records:
+        return "<tr><td colspan=\"4\">暂无训练记录</td></tr>"
+    return "\n".join(
+        "<tr>"
+        f"<td>{html.escape(record.created_at)}</td>"
+        f"<td>{html.escape(record.game_name or record.game_code)}</td>"
+        f"<td>{html.escape(record.action)}</td>"
+        f"<td>{html.escape(record.status)}</td>"
+        "</tr>"
+        for record in records[:20]
+    )
 
 
 def _recommendation_batches(games: Sequence[GameDashboard]) -> Tuple[RecommendationBatchHistory, ...]:
@@ -1276,6 +1691,7 @@ def _render_game_analysis(game: GameDashboard) -> str:
         content = "<p class=\"empty\">暂无本地开奖数据，先更新该彩种开奖数据后再查看分析。</p>"
     else:
         sections = "".join(_render_analysis_section(section) for section in analysis.sections)
+        omissions = "".join(_render_analysis_section(section) for section in analysis.omission_sections)
         content = f"""
 <section class="panel">
   <h2>{html.escape(game.name)} 历史号码分析</h2>
@@ -1286,6 +1702,11 @@ def _render_game_analysis(game: GameDashboard) -> str:
     <div><dt>最新日期</dt><dd>{html.escape(analysis.latest_draw_date or '-')}</dd></div>
   </dl>
   <div class="analysis-grid">{sections}</div>
+  <h3 class="analysis-subtitle">遗漏排行</h3>
+  <div class="analysis-grid">{omissions}</div>
+  {_render_sum_ranges(analysis.sum_ranges)}
+  {_render_partition_trends(analysis.partition_trends)}
+  {_render_candidate_score_table(analysis.candidate_scores)}
 </section>
 """.strip()
     return f"<section class=\"view\" data-view=\"analysis-{html.escape(game.code)}\">{content}</section>"
@@ -1297,7 +1718,7 @@ def _render_analysis_section(section: DashboardAnalysisSection) -> str:
     else:
         max_count = max(item.count for item in section.frequencies) or 1
         rows = "\n".join(
-            _render_frequency_item(item, max_count)
+            _render_frequency_item(item, max_count, "期" if "遗漏" in section.label else "次")
             for item in section.frequencies
         )
     return f"""
@@ -1308,14 +1729,67 @@ def _render_analysis_section(section: DashboardAnalysisSection) -> str:
 """.strip()
 
 
-def _render_frequency_item(item: DashboardNumberFrequency, max_count: int) -> str:
+def _render_frequency_item(item: DashboardNumberFrequency, max_count: int, unit: str = "次") -> str:
     width = max(6, min(100, round(item.count / max_count * 100)))
     return f"""
 <div class="frequency-item">
   <span class="number-pill">{html.escape(item.number)}</span>
   <span class="frequency-bar"><i style="width:{width}%"></i></span>
-  <span class="frequency-count">{item.count}次</span>
+  <span class="frequency-count">{item.count}{html.escape(unit)}</span>
 </div>
+""".strip()
+
+
+def _render_sum_ranges(buckets: Sequence[DashboardRangeBucket]) -> str:
+    if not buckets:
+        return ""
+    rows = "\n".join(
+        f"<tr><td>{html.escape(bucket.label)}</td><td>{bucket.count}</td><td>{bucket.rate:.1%}</td></tr>"
+        for bucket in buckets
+    )
+    return f"""
+<section class="analysis-section analysis-wide">
+  <h3>和值区间</h3>
+  <table><thead><tr><th>区间</th><th>期数</th><th>占比</th></tr></thead><tbody>{rows}</tbody></table>
+</section>
+""".strip()
+
+
+def _render_partition_trends(trends: Sequence[DashboardPartitionTrend]) -> str:
+    if not trends:
+        return ""
+    rows = "\n".join(
+        f"<tr><td>{html.escape(item.label)}</td><td>{item.average:.2f}</td></tr>"
+        for item in trends
+    )
+    return f"""
+<section class="analysis-section analysis-wide">
+  <h3>分区走势</h3>
+  <p class="panel-note">按低区/中区/高区统计平均每期出现数量，用来看号码分布是否偏向某一区。</p>
+  <table><thead><tr><th>分区</th><th>平均每期数量</th></tr></thead><tbody>{rows}</tbody></table>
+</section>
+""".strip()
+
+
+def _render_candidate_score_table(scores: Sequence[DashboardCandidateScore]) -> str:
+    if not scores:
+        return ""
+    rows = "\n".join(
+        "<tr>"
+        f"<td>{item.rank}</td>"
+        f"<td>{html.escape(item.strategy)}</td>"
+        f"<td>{html.escape(item.number)}</td>"
+        f"<td>{item.score}</td>"
+        f"<td>{html.escape(item.explanation)}</td>"
+        "</tr>"
+        for item in scores
+    )
+    return f"""
+<section class="analysis-section analysis-wide">
+  <h3>候选号码评分解释</h3>
+  <p class="panel-note">评分只解释候选号码和历史统计的贴合程度，不代表真实中奖概率。</p>
+  <table><thead><tr><th>排名</th><th>策略</th><th>号码</th><th>评分</th><th>解释</th></tr></thead><tbody>{rows}</tbody></table>
+</section>
 """.strip()
 
 
@@ -1654,14 +2128,33 @@ def _make_dashboard_handler(reports_dir: Path, repo_root: Path):
                 body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
                 self._send(200, "application/json; charset=utf-8", body)
                 return
+            if path == "/api/export":
+                params = parse_qs(urlparse(self.path).query)
+                export_format = (params.get("format") or ["csv"])[0]
+                try:
+                    model = load_dashboard_model(reports_dir)
+                    path_out = export_dashboard_snapshot(model, Path(repo_root) / "reports" / "exports", export_format)
+                    body = json.dumps({
+                        "ok": True,
+                        "path": str(path_out),
+                    }, ensure_ascii=False).encode("utf-8")
+                    self._send(200, "application/json; charset=utf-8", body)
+                except ValueError as exc:
+                    body = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+                    self._send(400, "application/json; charset=utf-8", body)
+                return
             if path.startswith("/api/jobs/"):
-                job_id = path.rsplit("/", 1)[-1]
+                parts = [part for part in path.split("/") if part]
+                job_id = parts[2] if len(parts) >= 3 else ""
                 job = _get_dashboard_job(job_id)
                 if job is None:
                     self._send(404, "application/json; charset=utf-8", json.dumps({
                         "ok": False,
                         "error": "job not found",
                     }, ensure_ascii=False).encode("utf-8"))
+                    return
+                if len(parts) == 4 and parts[3] == "events":
+                    self._send_job_events(job)
                     return
                 body = json.dumps(_job_snapshot(job), ensure_ascii=False).encode("utf-8")
                 self._send(200, "application/json; charset=utf-8", body)
@@ -1671,6 +2164,17 @@ def _make_dashboard_handler(reports_dir: Path, repo_root: Path):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            if path == "/api/config":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+                params = parse_qs(raw)
+                save_dashboard_config(
+                    _dashboard_db_path_for_root(repo_root),
+                    {key: values[0] for key, values in params.items() if values},
+                )
+                body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json; charset=utf-8", body)
+                return
             if path.startswith("/api/jobs/"):
                 action = path.rsplit("/", 1)[-1]
                 params = parse_qs(parsed.query)
@@ -1717,6 +2221,16 @@ def _make_dashboard_handler(reports_dir: Path, repo_root: Path):
             self.send_header("Pragma", "no-cache")
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_job_events(self, job: DashboardJob) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            for event in _job_sse_events(job):
+                self.wfile.write(event.encode("utf-8"))
+                self.wfile.flush()
 
     return DashboardHandler
 
@@ -2071,6 +2585,44 @@ dd { margin: 0; font-size: 16px; font-weight: 700; }
   gap: 8px;
   margin-top: 10px;
 }
+.backend-panel {
+  margin-bottom: 14px;
+}
+.backend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.backend-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+}
+.backend-card h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+.backend-card label {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.backend-card input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+}
+.export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .recommendation-batch {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -2202,11 +2754,17 @@ dd { margin: 0; font-size: 16px; font-weight: 700; }
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 12px;
 }
+.analysis-subtitle {
+  margin: 18px 0 10px;
+}
 .analysis-section {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 12px;
   background: var(--surface);
+}
+.analysis-wide {
+  margin-top: 12px;
 }
 .analysis-section h3 {
   margin: 0 0 10px;
@@ -2346,6 +2904,9 @@ const progressRemaining = document.getElementById('progress-remaining');
 const gameActionTabs = document.querySelectorAll('[data-game-tab]');
 const gameActionPanes = document.querySelectorAll('[data-game-pane]');
 const recommendationBatches = document.querySelectorAll('.recommendation-batch');
+const llmConfigForm = document.getElementById('llm-config-form');
+const configSaveStatus = document.getElementById('config-save-status');
+const exportStatus = document.getElementById('export-status');
 let actionInFlight = false;
 function setActionState(label, className) {
   actionStatus.textContent = label;
@@ -2396,6 +2957,24 @@ recommendationBatches.forEach((batch) => {
   updateLabel();
   batch.addEventListener('toggle', updateLabel);
 });
+if (llmConfigForm) {
+  llmConfigForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const response = await fetch('/api/config', {
+      method: 'POST',
+      body: new URLSearchParams(new FormData(llmConfigForm)),
+    });
+    configSaveStatus.textContent = response.ok ? '配置已保存到本地 SQLite' : '配置保存失败';
+  });
+}
+document.querySelectorAll('[data-export]').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const format = button.dataset.export;
+    const response = await fetch(`/api/export?format=${format}`);
+    const result = await response.json();
+    exportStatus.textContent = result.ok ? `已导出：${result.path}` : `导出失败：${result.error || ''}`;
+  });
+});
 function formatSeconds(value) {
   if (value === null || value === undefined) {
     return '计算中';
@@ -2435,6 +3014,30 @@ async function pollActionJob(jobId, button) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
+function watchActionJob(jobId, button) {
+  if (!window.EventSource) {
+    return pollActionJob(jobId, button);
+  }
+  return new Promise((resolve, reject) => {
+    const source = new EventSource(`/api/jobs/${jobId}/events`);
+    source.onmessage = (event) => {
+      const job = JSON.parse(event.data);
+      renderJobProgress(job);
+      if (job.status === 'completed' || job.status === 'failed') {
+        source.close();
+        setActionState(job.status === 'completed' ? '瀹屾垚' : '澶辫触', job.status === 'completed' ? 'ok' : 'error');
+        actionSummary.textContent = job.status === 'completed' ? `${button.textContent}瀹屾垚` : `${button.textContent}澶辫触`;
+        actionDetails.open = job.status !== 'completed';
+        refreshDashboardAfterJob(job);
+        resolve(job);
+      }
+    };
+    source.onerror = () => {
+      source.close();
+      pollActionJob(jobId, button).then(resolve).catch(reject);
+    };
+  });
+}
 function refreshDashboardAfterJob(job) {
   if (job.status !== 'completed') {
     return;
@@ -2469,7 +3072,7 @@ actionButtons.forEach((button) => {
       if (!response.ok && job.status !== 'running') {
         throw new Error(job.output || '任务启动失败');
       }
-      await pollActionJob(job.job_id, button);
+      await watchActionJob(job.job_id, button);
     } catch (error) {
       setActionState('失败', 'error');
       actionOutput.textContent = String(error);
